@@ -1,0 +1,525 @@
+diff -uNr orig/brain_v11_1_aipro.py patched/brain_v11_1_aipro.py
+--- orig/brain_v11_1_aipro.py	2026-05-01 20:08:52.277711694 +0000
++++ patched/brain_v11_1_aipro.py	2026-05-01 20:08:52.299067542 +0000
+@@ -509,6 +509,9 @@
+     bars: int
+     score: float
+     reason: str
++    tp1_hit: bool = False
++    mfe_r: float = 0.0
++    mae_r: float = 0.0
+ 
+ 
+ # =============================================================================
+@@ -1436,17 +1439,44 @@
+     def open_position(self, plan: OrderPlan, signal: TradeSignal) -> None:
+         rule = self.rules.get(plan.symbol)
+         if not rule:
+-            # 主网扫描时 demo-fapi 可能没有该合约，跳过而不崩溃
+-            logging.warning("SKIP_ORDER %s: demo-fapi 无该合约规则，跳过本笔开仓", plan.symbol)
+-            return
++            msg = f"{self.settings.trading_mode}-fapi 无该合约规则，拒绝静默跳过: {plan.symbol}"
++            logging.error("ORDER_FAILED %s", msg)
++            raise RuntimeError(msg)
+         qty_str = rule.round_qty(plan.qty)
++        logging.info(
++            "ORDER_REQUEST symbol=%s direction=%s qty=%s entry=%s sl=%s tp1=%s tp2=%s mode=%s",
++            plan.symbol, plan.direction, qty_str, plan.entry, plan.stop_loss, plan.tp1, plan.tp2, self.settings.trading_mode,
++        )
+         try:
+             self.client.set_leverage(plan.symbol, self.settings.leverage)
+             res = self.client.market_order(plan.symbol, plan.direction, qty_str)
+-            logging.info("%s 开仓返回: %s", self.settings.trading_mode.upper(), json.dumps(res, ensure_ascii=False)[:500])
++            logging.info("ORDER_RESPONSE %s", json.dumps(res, ensure_ascii=False)[:1000])
+         except Exception as exc:
+-            logging.error("ORDER_FAILED %s: 下单失败，跳过 | %s", plan.symbol, exc)
+-            return
++            logging.error("ORDER_FAILED %s: 下单失败 | %s", plan.symbol, exc)
++            raise RuntimeError(f"ORDER_FAILED {plan.symbol}: {exc}") from exc
++
++        order_id = res.get("orderId") or res.get("clientOrderId") or ""
++        verified = None
++        # demo-fapi positionRisk sometimes needs a short delay after market order.
++        for _ in range(env_int("ORDER_VERIFY_RETRIES", 5)):
++            try:
++                time.sleep(env_float("ORDER_VERIFY_SLEEP", 0.8))
++                for p in self.client.open_positions():
++                    if str(p.get("symbol")) == plan.symbol and abs(safe_float(p.get("positionAmt"), 0.0)) > 0:
++                        verified = p
++                        break
++                if verified:
++                    break
++            except Exception as exc:
++                logging.warning("ORDER_VERIFY_RETRY_FAILED %s: %s", plan.symbol, exc)
++        if not verified:
++            logging.error("ORDER_VERIFY_FAILED symbol=%s orderId=%s", plan.symbol, order_id)
++            raise RuntimeError(f"ORDER_VERIFY_FAILED {plan.symbol} orderId={order_id}")
++
++        logging.info(
++            "ORDER_VERIFY_OK symbol=%s orderId=%s positionAmt=%s entryPrice=%s",
++            plan.symbol, order_id, verified.get("positionAmt"), verified.get("entryPrice"),
++        )
+         if self.settings.use_exchange_protection:
+             try:
+                 sl_res = self.client.place_close_algo(plan.symbol, plan.direction, "STOP_MARKET", rule.round_price(plan.stop_loss))
+@@ -1456,7 +1486,8 @@
+                 logging.warning("PROTECTION_ORDER_FAILED %s: 保护单失败，仓位已开但无交易所止损 | %s", plan.symbol, exc)
+         else:
+             logging.warning("未启用 USE_EXCHANGE_PROTECTION，demo/live 不会自动挂交易所保护单。")
+-        self.journal.write({"time": utc_now().isoformat(), "event": "EXCHANGE_OPEN", "symbol": plan.symbol, "direction": plan.direction, "setup": plan.setup, "qty": qty_str, "price": plan.entry, "entry": plan.entry, "stop_loss": plan.stop_loss, "tp1": plan.tp1, "tp2": plan.tp2, "score": plan.score, "risk_usdt": plan.risk_usdt, "reason": " | ".join(plan.reasons[:6])})
++        actual_entry = safe_float(verified.get("entryPrice"), plan.entry)
++        self.journal.write({"time": utc_now().isoformat(), "event": "EXCHANGE_OPEN", "symbol": plan.symbol, "direction": plan.direction, "setup": plan.setup, "qty": qty_str, "price": actual_entry, "entry": plan.entry, "stop_loss": plan.stop_loss, "tp1": plan.tp1, "tp2": plan.tp2, "score": plan.score, "risk_usdt": plan.risk_usdt, "reason": " | ".join(plan.reasons[:6]) + f" | orderId={order_id}"})
+ 
+ 
+ # =============================================================================
+@@ -1472,7 +1503,8 @@
+ 
+     def backtest_symbol(self, symbol: str, quote_volume: float = 0.0, settings_override: Optional[Settings] = None) -> List[BacktestTrade]:
+         st = settings_override or self.settings
+-        engine = StrategyEngine(st, client=None)
++        engine_cls = globals().get("StrategyEngineV10", globals().get("StrategyEngineV9", StrategyEngine))
++        engine = engine_cls(st, client=None)
+         start_ms = iso_to_ms(st.backtest_start) if st.backtest_start else None
+         end_ms = iso_to_ms(st.backtest_end) if st.backtest_end else None
+         entry = self.client.historical_klines(symbol, st.entry_interval, start_ms, end_ms, st.backtest_limit)
+@@ -1497,16 +1529,38 @@
+             sig = engine.analyze_symbol_from_candles(symbol, signal_entry, trend_slice, regime, quote_volume, 0.0)
+             if not sig.allowed:
+                 continue
+-            trade = self._simulate_trade(symbol, sig, entry, i + 1 + st.entry_delay_bars, st)
++            entry_i = i + 1 + max(0, st.entry_delay_bars)
++            if env_bool("ENABLE_CONFIRM_V2", False) and not self._confirm_v2_ok(sig.direction, entry, i, entry_i):
++                continue
++            trade = self._simulate_trade(symbol, sig, entry, entry_i, st)
+             if trade:
+                 trades.append(trade)
+-                open_until = min(i + 1 + st.entry_delay_bars + trade.bars, len(entry) - 1)
++                open_until = min(entry_i + trade.bars, len(entry) - 1)
+         return trades
+ 
++    def _confirm_v2_ok(self, direction: str, candles: Sequence[Candle], signal_i: int, entry_i: int) -> bool:
++        """Backtest version of live ENABLE_CONFIRM_V2.
++
++        Signal is formed on candles[signal_i]. With ENTRY_DELAY_BARS=1, we wait for
++        candles[signal_i+1] to close and enter at candles[signal_i+2].open.
++        The confirmation candle must close in the trade direction.
++        """
++        confirm_i = max(signal_i + 1, entry_i - 1)
++        if confirm_i >= len(candles):
++            return False
++        c = candles[confirm_i]
++        if direction == "LONG":
++            return c.close > c.open
++        if direction == "SHORT":
++            return c.close < c.open
++        return False
++
+     def _simulate_trade(self, symbol: str, sig: TradeSignal, candles: Sequence[Candle], entry_i: int, st: Settings) -> Optional[BacktestTrade]:
+         if entry_i >= len(candles):
+             return None
+         direction = sig.direction
++        if direction not in {"LONG", "SHORT"}:
++            return None
+         entry_bar = candles[entry_i]
+         slip = st.slippage_bps / 10000.0
+         fee_r = st.fee_bps / 10000.0
+@@ -1515,86 +1569,115 @@
+         risk = abs(entry_price - stop)
+         if risk <= 0:
+             return None
+-        # 按入场价重新推导 TP，避免信号收盘价与下一根开盘价存在缺口
++
++        # Rebuild TP levels from the actual executable entry price. This keeps
++        # backtest consistent with delayed entry at next-bar open.
+         if direction == "LONG":
+             tp1 = entry_price + st.tp1_r * risk
+             tp2 = entry_price + st.tp2_r * risk
+         else:
+             tp1 = entry_price - st.tp1_r * risk
+             tp2 = entry_price - st.tp2_r * risk
++
+         qty_left = 1.0
+         realized_r = 0.0
+         tp1_hit = False
+-        highest = entry_price
+-        lowest = entry_price
+         current_stop = stop
+         exit_price = entry_price
+         exit_t = entry_bar.close_time
+         exit_reason = "MAX_HOLD"
++        mfe_r = 0.0
++        mae_r = 0.0
+         max_i = min(len(candles) - 1, entry_i + st.max_hold_bars)
++
+         for j in range(entry_i, max_i + 1):
+             bar = candles[j]
+             exit_t = bar.close_time
++
+             if direction == "LONG":
+-                highest = max(highest, bar.high)
+-                if highest > entry_price and sig.atr > 0:
+-                    current_stop = max(current_stop, highest - st.trailing_atr_mult * sig.atr)
++                mfe_r = max(mfe_r, (bar.high - entry_price) / risk)
++                mae_r = max(mae_r, (entry_price - bar.low) / risk)
+                 stop_hit = bar.low <= current_stop
+-                tp2_hit = bar.high >= tp2
+                 tp1_bar_hit = (not tp1_hit) and bar.high >= tp1
+-                # FIX: TP1 partial close always runs before stop check
+-                # (TP1 = partial exit + move stop to breakeven; this is risk mgmt, not just profit-taking)
++                tp2_hit = bar.high >= tp2
++
++                # If SL and TP are in the same candle, conservative mode assumes
++                # SL happened first. Non-conservative mode allows TP1 risk reduction first.
++                if (not tp1_hit) and st.conservative_intrabar and stop_hit and (tp1_bar_hit or tp2_hit):
++                    exit_price = current_stop * (1 - slip)
++                    realized_r += qty_left * ((exit_price - entry_price) / risk)
++                    exit_reason = "STOP"
++                    break
++
+                 if tp1_bar_hit:
+                     close_qty = qty_left * clamp(st.tp1_pct, 0.05, 0.95)
+                     realized_r += close_qty * ((tp1 - entry_price) / risk)
+                     qty_left -= close_qty
+                     tp1_hit = True
+                     current_stop = max(current_stop, entry_price)
+-                if stop_hit:
+-                    exit_price = current_stop * (1 - slip)
+-                    realized_r += qty_left * ((exit_price - entry_price) / risk)
+-                    exit_reason = "STOP"
+-                    break
+-                if tp2_hit:
++
++                stop_hit_after = bar.low <= current_stop
++                if tp2_hit and not (st.conservative_intrabar and stop_hit_after):
+                     exit_price = tp2 * (1 - slip)
+                     realized_r += qty_left * ((exit_price - entry_price) / risk)
+                     exit_reason = "TP2"
+                     break
++                if stop_hit_after:
++                    exit_price = current_stop * (1 - slip)
++                    realized_r += qty_left * ((exit_price - entry_price) / risk)
++                    exit_reason = "BE" if tp1_hit and abs(current_stop - entry_price) <= max(entry_price, 1e-12) * 1e-10 else "STOP"
++                    break
++
+             else:
+-                lowest = min(lowest, bar.low)
+-                if lowest < entry_price and sig.atr > 0:
+-                    current_stop = min(current_stop, lowest + st.trailing_atr_mult * sig.atr)
++                mfe_r = max(mfe_r, (entry_price - bar.low) / risk)
++                mae_r = max(mae_r, (bar.high - entry_price) / risk)
+                 stop_hit = bar.high >= current_stop
+-                tp2_hit = bar.low <= tp2
+                 tp1_bar_hit = (not tp1_hit) and bar.low <= tp1
+-                # FIX: TP1 partial close always runs before stop check
++                tp2_hit = bar.low <= tp2
++
++                if (not tp1_hit) and st.conservative_intrabar and stop_hit and (tp1_bar_hit or tp2_hit):
++                    exit_price = current_stop * (1 + slip)
++                    realized_r += qty_left * ((entry_price - exit_price) / risk)
++                    exit_reason = "STOP"
++                    break
++
+                 if tp1_bar_hit:
+                     close_qty = qty_left * clamp(st.tp1_pct, 0.05, 0.95)
+                     realized_r += close_qty * ((entry_price - tp1) / risk)
+                     qty_left -= close_qty
+                     tp1_hit = True
+                     current_stop = min(current_stop, entry_price)
+-                if stop_hit:
+-                    exit_price = current_stop * (1 + slip)
+-                    realized_r += qty_left * ((entry_price - exit_price) / risk)
+-                    exit_reason = "STOP"
+-                    break
+-                if tp2_hit:
++
++                stop_hit_after = bar.high >= current_stop
++                if tp2_hit and not (st.conservative_intrabar and stop_hit_after):
+                     exit_price = tp2 * (1 + slip)
+                     realized_r += qty_left * ((entry_price - exit_price) / risk)
+                     exit_reason = "TP2"
+                     break
++                if stop_hit_after:
++                    exit_price = current_stop * (1 + slip)
++                    realized_r += qty_left * ((entry_price - exit_price) / risk)
++                    exit_reason = "BE" if tp1_hit and abs(current_stop - entry_price) <= max(entry_price, 1e-12) * 1e-10 else "STOP"
++                    break
+         else:
+             last = candles[max_i]
+             exit_price = last.close * (1 - slip if direction == "LONG" else 1 + slip)
+             realized_r += qty_left * (((exit_price - entry_price) / risk) if direction == "LONG" else ((entry_price - exit_price) / risk))
+ 
+-        # 粗略费用：入场 + 出场/分批，折算 R，按风险距离和 entry 粗估
++        # Approximate fees: entry + final exit + TP1 partial exit when applicable.
+         fee_r_total = ((entry_price * fee_r) + (exit_price * fee_r)) / risk
++        if tp1_hit:
++            fee_r_total += (tp1 * fee_r) / risk * clamp(st.tp1_pct, 0.05, 0.95)
+         realized_r -= fee_r_total
+         pnl_pct = realized_r * (risk / entry_price) * 100.0
+         bars = max(1, int((exit_t - entry_bar.open_time) / interval_to_ms(st.entry_interval)))
+-        return BacktestTrade(symbol, direction, sig.setup, entry_bar.open_time, exit_t, entry_price, exit_price, stop, tp1, tp2, realized_r, pnl_pct, bars, sig.score, exit_reason + " | " + " | ".join(sig.reasons[:4]))
++        reason_parts = [exit_reason]
++        if tp1_hit:
++            reason_parts.append("TP1_HIT")
++        reason_parts.append(f"MFE={mfe_r:.2f}R")
++        reason_parts.append(f"MAE={mae_r:.2f}R")
++        reason_parts.extend(sig.reasons[:4])
++        return BacktestTrade(symbol, direction, sig.setup, entry_bar.open_time, exit_t, entry_price, exit_price, stop, tp1, tp2, realized_r, pnl_pct, bars, sig.score, " | ".join(reason_parts), tp1_hit=tp1_hit, mfe_r=round(mfe_r, 4), mae_r=round(mae_r, 4))
+ 
+     def backtest_many(self, symbols: Sequence[Tuple[str, float]], settings_override: Optional[Settings] = None) -> List[BacktestTrade]:
+         all_trades: List[BacktestTrade] = []
+@@ -1665,6 +1748,13 @@
+     sharpe_like = expectancy / stdev * math.sqrt(max(n, 1)) if stdev > 0 else 0.0
+     sqn = expectancy / stdev * math.sqrt(n) if stdev > 0 and n > 0 else 0.0
+     avg_bars = sum(t.bars for t in trades) / n if n else 0.0
++    exit_reasons: Dict[str, int] = {}
++    for t in trades:
++        key = str(t.reason).split("|")[0].strip().upper() or "UNKNOWN"
++        exit_reasons[key] = exit_reasons.get(key, 0) + 1
++    tp1_hits = sum(1 for t in trades if bool(getattr(t, "tp1_hit", False)) or "TP1_HIT" in str(t.reason))
++    mfe_thresholds = {f"mfe_ge_{x:g}R": sum(1 for t in trades if safe_float(getattr(t, "mfe_r", 0.0), 0.0) >= x) for x in (0.5, 0.8, 1.0, 1.5, 2.0)}
++    mfe_1r_then_stop = sum(1 for t in trades if safe_float(getattr(t, "mfe_r", 0.0), 0.0) >= 1.0 and str(t.reason).split("|")[0].strip().upper() == "STOP")
+     return {
+         "trades": n,
+         "win_rate": round(win_rate, 4),
+@@ -1677,6 +1767,13 @@
+         "sharpe_like": round(sharpe_like, 4),
+         "sqn": round(sqn, 4),
+         "avg_bars": round(avg_bars, 2),
++        "exit_reasons": exit_reasons,
++        "tp1_hits": tp1_hits,
++        "tp2_hits": exit_reasons.get("TP2", 0),
++        "stop_hits": exit_reasons.get("STOP", 0),
++        "be_hits": exit_reasons.get("BE", 0),
++        "mfe_thresholds": mfe_thresholds,
++        "mfe_ge_1r_then_stop": mfe_1r_then_stop,
+         "by_symbol": by_group_metrics(trades, "symbol"),
+         "by_setup": by_group_metrics(trades, "setup"),
+         "by_direction": by_group_metrics(trades, "direction"),
+@@ -1691,7 +1788,15 @@
+     out: Dict[str, Dict[str, Any]] = {}
+     for k, rows in groups.items():
+         rs = [t.r_multiple for t in rows]
+-        out[k] = {"trades": len(rows), "expectancy_R": round(sum(rs) / len(rs), 4), "win_rate": round(sum(1 for r in rs if r > 0) / len(rs), 4), "total_R": round(sum(rs), 4)}
++        wins = [r for r in rs if r > 0]
++        losses = [r for r in rs if r <= 0]
++        gross_loss = abs(sum(losses))
++        pf = sum(wins) / gross_loss if gross_loss > 0 else (999.0 if wins else 0.0)
++        exits: Dict[str, int] = {}
++        for t in rows:
++            key = str(t.reason).split("|")[0].strip().upper() or "UNKNOWN"
++            exits[key] = exits.get(key, 0) + 1
++        out[k] = {"trades": len(rows), "expectancy_R": round(sum(rs) / len(rs), 4), "win_rate": round(sum(1 for r in rs if r > 0) / len(rs), 4), "profit_factor": round(pf, 4), "total_R": round(sum(rs), 4), "tp1_hits": sum(1 for t in rows if bool(getattr(t, "tp1_hit", False)) or "TP1_HIT" in str(t.reason)), "exit_reasons": exits}
+     return out
+ 
+ 
+@@ -1709,7 +1814,7 @@
+ 
+ def write_backtest_csv(path: Path, trades: Sequence[BacktestTrade]) -> None:
+     path.parent.mkdir(parents=True, exist_ok=True)
+-    fields = ["symbol", "direction", "setup", "entry_time", "exit_time", "entry", "exit", "stop_loss", "tp1", "tp2", "r_multiple", "pnl_pct", "bars", "score", "reason"]
++    fields = ["symbol", "direction", "setup", "entry_time", "exit_time", "entry", "exit", "stop_loss", "tp1", "tp2", "r_multiple", "pnl_pct", "bars", "score", "reason", "tp1_hit", "mfe_r", "mae_r"]
+     with path.open("w", encoding="utf-8", newline="") as f:
+         w = csv.DictWriter(f, fieldnames=fields)
+         w.writeheader()
+@@ -3611,6 +3716,10 @@
+             "ENABLE_TREND_SETUP": env_bool("ENABLE_TREND_SETUP", False),
+             "ENABLE_BREAKOUT_SETUP": env_bool("ENABLE_BREAKOUT_SETUP", True),
+             "REQUIRE_BACKTEST_QUALITY_GATE": env_bool("REQUIRE_BACKTEST_QUALITY_GATE", True),
++            "market_data_source": "mainnet_public" if env_bool("USE_MAINNET_MARKET_DATA", False) else "execution_base",
++            "execution_source": "demo_fapi" if self.settings.trading_mode == "demo" else ("live_fapi" if self.settings.trading_mode == "live" else "paper_state"),
++            "base_url": self.settings.base_url,
++            "market_data_url": getattr(self.client, "market_data_url", self.settings.base_url),
+         }
+         if self.settings.trading_mode == "live":
+             if not checks["config"]["live_confirmed"]:
+@@ -3622,6 +3731,8 @@
+         try:
+             positions = self.broker.positions()
+             checks["broker"]["positions"] = len(positions)
++            checks["broker"]["position_detail"] = positions
++            checks["broker"]["position_source"] = checks["config"]["execution_source"]
+             checks["broker"]["equity"] = self.broker.equity({})
+         except Exception as exc:
+             checks["blockers"].append(f"broker 检查失败: {exc}")
+@@ -4578,7 +4689,7 @@
+         candidate, notes = super().approve(decision, payload)
+         if not candidate:
+             return candidate, notes
+-        blockers = list(notes)
++        blockers: List[str] = []
+         setup = str(candidate.get("setup", "")).lower()
+         tier = str(candidate.get("process_tier", "")).upper()
+         score = safe_float(candidate.get("score"), 0.0)
+@@ -4601,8 +4712,8 @@
+         if candidate.get("risk_blockers"):
+             blockers.append("V10 候选仍包含 risk_blockers")
+         if blockers:
+-            return None, blockers
+-        return candidate, ["V10 RiskGovernor 最终通过"]
++            return None, notes + blockers
++        return candidate, notes + ["V10 RiskGovernor 最终通过"]
+ 
+ 
+ class BrainV10(BrainV9):
+@@ -4939,12 +5050,17 @@
+     min_edge_n = env_int("V11_MIN_EDGE_TRADES", 20 if settings.trading_mode == "paper" else 40)
+     min_edge_exp = env_float("V11_MIN_EDGE_EXPECTANCY_R", 0.00 if settings.trading_mode == "paper" else 0.04)
+     min_edge_pf = env_float("V11_MIN_EDGE_PF", 1.00 if settings.trading_mode == "paper" else 1.12)
+-    if edge_n >= min_edge_n:
++    require_edge = env_bool("V11_REQUIRE_EDGE_FOR_EXCHANGE", True)
++    if edge_n <= 0:
++        warnings.append("V11 Edge 无样本；仅允许 demo/paper 小仓采样，live 禁止")
++        if settings.trading_mode == "live" or (settings.trading_mode == "demo" and require_edge):
++            blockers.append(f"V11 demo/live 要求 Edge 样本 >= {min_edge_n}")
++    elif edge_n >= min_edge_n:
+         if edge_exp < min_edge_exp or edge_pf < min_edge_pf:
+             blockers.append(f"V11 Edge 不达标 n={edge_n} exp={edge_exp:.3f} pf={edge_pf:.2f}")
+     else:
+-        warnings.append(f"V11 Edge 样本不足 n={edge_n}；仅适合 paper 观察")
+-        if settings.trading_mode in {"demo", "live"} and env_bool("V11_REQUIRE_EDGE_FOR_EXCHANGE", True):
++        warnings.append(f"V11 Edge 样本不足 n={edge_n}；仅适合 paper/demo 观察")
++        if settings.trading_mode in {"demo", "live"} and require_edge:
+             blockers.append(f"V11 demo/live 要求 Edge 样本 >= {min_edge_n}")
+ 
+     if not symbol_is_major(symbol):
+@@ -4969,7 +5085,7 @@
+         candidate, notes = super().approve(decision, payload)
+         if not candidate:
+             return candidate, notes
+-        blockers = list(notes)
++        blockers: List[str] = []
+         gate = candidate.get("v11_gate") or _v11_candidate_gate(candidate, self.settings)
+         if gate.get("blockers"):
+             blockers.extend([str(x) for x in gate.get("blockers", [])])
+@@ -4984,8 +5100,8 @@
+             if safe_float(plan.get("notional"), 0.0) > env_float("V11_LIVE_MAX_NOTIONAL_HARD", env_float("LIVE_MAX_ORDER_NOTIONAL", 50.0)):
+                 blockers.append("V11 live 订单名义价值超过硬上限")
+         if blockers:
+-            return None, list(dict.fromkeys([str(x) for x in blockers if str(x).strip()]))
+-        return candidate, ["V11 institutional governor 最终通过"]
++            return None, list(dict.fromkeys([str(x) for x in (notes + blockers) if str(x).strip()]))
++        return candidate, notes + ["V11 institutional governor 最终通过"]
+ 
+ 
+ class BrainV11(BrainV10):
+diff -uNr orig/bt_analyze.py patched/bt_analyze.py
+--- orig/bt_analyze.py	2026-05-01 20:08:52.278688889 +0000
++++ patched/bt_analyze.py	2026-05-01 20:08:52.300512984 +0000
+@@ -121,11 +121,23 @@
+     else:
+         sharpe = 0.0
+ 
+-    # 出场原因分布
++    # 出场原因分布 + TP1/MFE 诊断
+     reasons = defaultdict(int)
++    tp1_hits = 0
++    mfe_buckets = {"mfe_ge_0.5R": 0, "mfe_ge_0.8R": 0, "mfe_ge_1.0R": 0, "mfe_ge_1.5R": 0, "mfe_ge_2.0R": 0}
++    mfe_ge_1r_then_stop = 0
+     for t in trades:
+-        r = str(t.get("reason", "UNKNOWN")).split("|")[0].strip().upper()
++        reason_raw = str(t.get("reason", "UNKNOWN"))
++        r = reason_raw.split("|")[0].strip().upper()
+         reasons[r] += 1
++        if str(t.get("tp1_hit", "")).lower() in {"true", "1", "yes"} or "TP1_HIT" in reason_raw.upper():
++            tp1_hits += 1
++        mfe = safe_float(t.get("mfe_r", 0.0), 0.0)
++        for threshold, key in [(0.5, "mfe_ge_0.5R"), (0.8, "mfe_ge_0.8R"), (1.0, "mfe_ge_1.0R"), (1.5, "mfe_ge_1.5R"), (2.0, "mfe_ge_2.0R")]:
++            if mfe >= threshold:
++                mfe_buckets[key] += 1
++        if mfe >= 1.0 and r == "STOP":
++            mfe_ge_1r_then_stop += 1
+ 
+     return {
+         "label": label,
+@@ -142,6 +154,12 @@
+         "max_consec_win": max_consec_win,
+         "sharpe_per_trade": round(sharpe, 4),
+         "exit_reasons": dict(reasons),
++        "tp1_hits": tp1_hits,
++        "tp2_hits": dict(reasons).get("TP2", 0),
++        "stop_hits": dict(reasons).get("STOP", 0),
++        "be_hits": dict(reasons).get("BE", 0),
++        "mfe_thresholds": mfe_buckets,
++        "mfe_ge_1r_then_stop": mfe_ge_1r_then_stop,
+     }
+ 
+ # ─── 按维度分组 ───────────────────────────────────────────────────────────────
+diff -uNr orig/dashboard.py patched/dashboard.py
+--- orig/dashboard.py	2026-05-01 20:08:52.278245667 +0000
++++ patched/dashboard.py	2026-05-01 20:08:52.299775239 +0000
+@@ -189,40 +189,42 @@
+ </div>"""
+ 
+ def build_positions(health, proc):
+-    pos_dict = {}
+-    # from process_dashboard candidates with plan
+-    top = (proc or {}).get("top", [])
+-    for c in top:
+-        plan = c.get("plan")
+-        if plan and isinstance(plan, dict):
+-            sym = c.get("symbol","")
+-            pos_dict[sym] = c
+-    # from healthcheck broker positions if exists
++    # 当前持仓只能来自 healthcheck.broker.position_detail（demo_fapi / live_fapi / paper_state）。
++    # 不能把 process_dashboard.top 里的候选 plan 当作持仓，否则会出现 UI 假持仓。
+     broker_pos = (health or {}).get("broker",{}).get("position_detail",{}) or {}
+-    for sym, p in broker_pos.items():
+-        pos_dict[sym] = p
+-
+-    if not pos_dict:
++    if not isinstance(broker_pos, dict) or not broker_pos:
+         return '<p class="muted" style="padding:12px 0">暂无持仓</p>'
+ 
+     rows = ""
+-    for sym, c in pos_dict.items():
+-        plan = c.get("plan",{}) or c
+-        direction = c.get("direction","—")
+-        entry  = plan.get("entry","—")
+-        sl     = plan.get("stop_loss","—")
+-        tp2    = plan.get("tp2","—")
+-        score  = c.get("score","—")
+-        setup  = c.get("setup","—")
+-        pnl    = c.get("unrealized_pnl","—")
++    for sym, p in broker_pos.items():
++        amt = fmt_num(p.get("positionAmt", p.get("qty", "—")))
++        # Binance one-way mode returns positionSide="BOTH". Prefer positionAmt
++        # to infer the real LONG/SHORT direction for dashboard display.
++        raw_dir = p.get("direction") or ""
++        try:
++            a = float(p.get("positionAmt", p.get("qty", 0)) or 0)
++            if a > 0:
++                raw_dir = "LONG"
++            elif a < 0:
++                raw_dir = "SHORT"
++        except Exception:
++            pass
++        if not raw_dir or str(raw_dir).upper() == "BOTH":
++            raw_dir = p.get("positionSide") or "—"
++        entry  = p.get("entryPrice", p.get("entry", "—"))
++        mark   = p.get("markPrice", p.get("latest", "—"))
++        pnl    = p.get("unRealizedProfit", p.get("unrealized_pnl", "—"))
++        sl     = p.get("stop_loss", "—")
++        tp2    = p.get("tp2", "—")
+         pnl_c  = pnl_class(pnl) if pnl != "—" else ""
+         pnl_str = f'<span class="{pnl_c}">{esc(fmt_num(pnl))}</span>' if pnl != "—" else "—"
+         rows += f"""<tr>
+           <td class="sym">{esc(sym)}</td>
+-          <td>{dir_badge(direction)}</td>
++          <td>{dir_badge(raw_dir)}</td>
+           <td>{esc(fmt_num(entry))}</td>
+-          <td>—</td>
++          <td>{esc(fmt_num(mark))}</td>
+           <td>{pnl_str}</td>
++          <td class="muted">{esc(fmt_num(amt))}</td>
+           <td class="neg">{esc(fmt_num(sl))}</td>
+           <td class="pos">{esc(fmt_num(tp2))}</td>
+           <td>{status_badge("OPEN")}</td>
+@@ -230,7 +232,7 @@
+     return f"""<div class="table-wrap"><table>
+       <thead><tr>
+         <th>币对</th><th>方向</th><th>开仓价</th><th>最新价</th>
+-        <th>浮盈亏</th><th>止损</th><th>止盈</th><th>状态</th>
++        <th>浮盈亏</th><th>数量</th><th>止损</th><th>止盈</th><th>状态</th>
+       </tr></thead>
+       <tbody>{rows}</tbody>
+     </table></div>"""
